@@ -70,6 +70,7 @@ add_subdirectory(tee)
 add_subdirectory(testing)
 add_subdirectory(videoutils)
 add_subdirectory(wireless)
+add_subdirectory(myapps)
 
 # add examples and external at the end to allow library dependencies
 add_subdirectory(examples)
