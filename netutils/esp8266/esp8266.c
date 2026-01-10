@@ -1154,6 +1154,11 @@ static int lesp_parse_cwlap_ans_line(char *ptr, lesp_ap_t *ap)
 
   ptr += 8;
 
+  if (*ptr == '\0' || *ptr == ')')
+    {
+      return -1;
+    }
+
   while (*ptr != '\0')
     {
       /* Determine separator */
@@ -1189,6 +1194,10 @@ static int lesp_parse_cwlap_ans_line(char *ptr, lesp_ap_t *ap)
                        sep = paren;
                      }
                  }
+            }
+          else
+            {
+              break;
             }
         }
       else
@@ -2222,32 +2231,44 @@ int lesp_list_access_points(lesp_cb_t cb)
   while (ret >= 0)
     {
       ret = lesp_read(LESP_TIMEOUT_MS_LISP_AP);
+      
+      if (g_lesp_state.and == LESP_OK)
+        {
+          ninfo("Received OK, scan complete.\n");
+          ret = 0;
+          break;
+        }
+
+      if (g_lesp_state.and == LESP_ERR)
+        {
+          nerr("ERROR: Received ERROR/FAIL during scan.\n");
+          ret = -1;
+          break;
+        }
+
       if (ret < 0)
+        {
+          nwarn("WARNING: Read timeout, retrying...\n");
+          ret = 0;
+          continue;
+        }
+
+      if (ret == 0)
         {
           continue;
         }
 
-      ninfo("Read:%s\n", g_lesp_state.bufans);
+      ninfo("Read: %s\n", g_lesp_state.bufans);
 
-      /* Check OK */
-      if (strcmp(g_lesp_state.bufans, "OK") == 0)
+      if (g_lesp_state.bufans[0] == '\0')
         {
-          break;
-        }
-
-      /* Check ERROR or FAIL */
-      if (strncmp(g_lesp_state.bufans, "ERROR", 5) == 0 ||
-          strncmp(g_lesp_state.bufans, "FAIL", 4) == 0)
-        {
-           ret = -1;
-           break;
+          continue;
         }
 
       /* Check +CWLAP prefix */
       if (strncmp(g_lesp_state.bufans, "+CWLAP", 6) != 0)
         {
           nwarn("WARNING: Ignored non-AP line: %s\n", g_lesp_state.bufans);
-          ret = 0; 
           continue;
         }
 
@@ -2258,15 +2279,9 @@ int lesp_list_access_points(lesp_cb_t cb)
 
       if (parse_ret < 0)
         {
-          nwarn("WARNING: Malformed AP line skipped: %s\n", g_lesp_state.bufans);
-          ret = 0; 
+          nwarn("WARNING: Malformed AP line skipped: %s\n", 
+                g_lesp_state.bufans);
           continue;
-        }
-
-      if (ap.rssi == 0)
-        {
-           nwarn("WARNING: Empty AP data skipped (RSSI=0)\n");
-           continue;
         }
 
       if (cb)
@@ -2278,18 +2293,13 @@ int lesp_list_access_points(lesp_cb_t cb)
 
   pthread_mutex_unlock(&g_lesp_state.mutex);
 
-  if (number > 0)
-    {
-      ninfo("Scan finished. Found %d APs.\n", number);
-      return number;
-    }
-
   if (ret < 0)
     {
-      nerr("ERROR: list access points failed.");
+      nerr("ERROR: list access points failed.\n");
       return -1;
     }
 
+  ninfo("Scan finished. Found %d APs.\n", number);
   return number;
 }
 
