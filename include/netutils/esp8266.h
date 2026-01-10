@@ -29,6 +29,7 @@
 
 #include "nuttx/config.h"
 
+#include <stdint.h>
 #include <netinet/in.h>
 
 #ifdef CONFIG_NETUTILS_ESP8266
@@ -55,12 +56,15 @@ typedef enum
 
 typedef enum
 {
-  LESP_SECURITY_NONE = 0,
-  LESP_SECURITY_WEP,
-  LESP_SECURITY_WPA_PSK,
-  LESP_SECURITY_WPA2_PSK,
-  LESP_SECURITY_WPA_WPA2_PSK,
-  LESP_SECURITY_NBR
+  LESP_SECURITY_NONE = 0,         /* 0: OPEN */
+  LESP_SECURITY_WEP,              /* 1: WEP */
+  LESP_SECURITY_WPA_PSK,          /* 2: WPA_PSK */
+  LESP_SECURITY_WPA2_PSK,         /* 3: WPA2_PSK */
+  LESP_SECURITY_WPA_WPA2_PSK,     /* 4: WPA_WPA2_PSK */
+  LESP_SECURITY_WPA2_ENTERPRISE,  /* 5: WPA2_ENTERPRISE */
+  LESP_SECURITY_WPA3_PSK,         /* 6: WPA3_PSK */
+  LESP_SECURITY_WPA2_WPA3_PSK,    /* 7: WPA2_WPA3_PSK */
+  LESP_SECURITY_WAPI_PSK          /* 8: WAPI_PSK */
 } lesp_security_t;
 
 typedef struct
@@ -68,8 +72,17 @@ typedef struct
   lesp_security_t security;
   char ssid[LESP_SSID_SIZE + 1];    /* +1 for null char */
   uint8_t bssid[LESP_BSSID_SIZE];
-  int rssi;
+  int8_t rssi;
   int channel;
+  int scan_type;
+  int scan_time_min;
+  int scan_time_max;
+  int freq_offset;
+  int freqcal_val;
+  int pairwise_cipher;
+  int group_cipher;
+  int bgn;
+  int wps;
 } lesp_ap_t;
 
 /****************************************************************************

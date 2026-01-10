@@ -421,7 +421,10 @@ static int lesp_low_level_read(uint8_t *buf, int size)
   if (ret < 0)
     {
       int errcode = errno;
-      nerr("ERROR: worker read Error %d (errno %d)\n", ret, errcode);
+      if (errcode != EINTR) 
+        {
+          nerr("ERROR: worker read Error %d (errno %d)\n", ret, errcode);
+        }
       UNUSED(errcode);
     }
   else if ((fds[0].revents & POLLERR) && (fds[0].revents & POLLHUP))
@@ -1138,100 +1141,196 @@ static int lesp_parse_cwjap_ans_line(char *ptr, lesp_ap_t *ap)
 
 static int lesp_parse_cwlap_ans_line(char *ptr, lesp_ap_t *ap)
 {
-  int field_idx;
-  char *ptr_next;
+  int field_idx = 1;
+  char *sep;
+  char *next_ptr;
 
-  for (field_idx = 0; field_idx <= 5; field_idx++)
+  /* Check prefix +CWLAP:( */
+
+  if (strncmp(ptr, "+CWLAP:(", 8) != 0)
     {
-      if (field_idx == 0)
+      return -1;
+    }
+
+  ptr += 8;
+
+  while (*ptr != '\0')
+    {
+      /* Determine separator */
+      
+      if (*ptr == '"')
         {
-          ptr_next = strchr(ptr, '(');
-        }
-      else if (field_idx == 5)
-        {
-          ptr_next = strchr(ptr, ')');
+          /* Quoted string: find end quote */
+
+          sep = strchr(ptr + 1, '"');
+          if (sep)
+            {
+               /* The separator should be the character after the quote */
+               
+               if (sep[1] == ',' || sep[1] == ')')
+                 {
+                   sep = sep + 1;
+                 }
+               else
+                 {
+                   /* Fallback or malformed: search for comma or paren */
+                   char *comma = strchr(sep + 1, ',');
+                   char *paren = strchr(sep + 1, ')');
+                   if (comma && paren)
+                     {
+                       sep = (comma < paren) ? comma : paren;
+                     }
+                   else if (comma)
+                     {
+                       sep = comma;
+                     }
+                   else
+                     {
+                       sep = paren;
+                     }
+                 }
+            }
         }
       else
         {
-          ptr_next = strchr(ptr, ',');
+          char *comma = strchr(ptr, ',');
+          char *paren = strchr(ptr, ')');
+          
+          if (comma && paren)
+            {
+              sep = (comma < paren) ? comma : paren;
+            }
+          else if (comma)
+            {
+              sep = comma;
+            }
+          else
+            {
+              sep = paren;
+            }
         }
 
-      if (ptr_next == NULL)
+      if (!sep)
         {
-          return -1;
+          break;
         }
 
-      *ptr_next = '\0';
+      /* Handle End of Line */
+      if (*sep == ')')
+        {
+           *sep = '\0';
+           next_ptr = NULL; /* Stop after this */
+        }
+      else
+        {
+           *sep = '\0';
+           next_ptr = sep + 1;
+        }
 
+      /* Parse Fields */
       switch (field_idx)
         {
-          case 0:
-              if (strcmp(ptr, "+CWLAP:") != 0)
-                {
-                  return -1;
-                }
-              break;
+          case 1: /* ecn */
+            ap->security = (lesp_security_t)atoi(ptr);
+            break;
 
-          case 1:
-                {
-                  int i = *ptr - '0';
+          case 2: /* ssid */
+            if (*ptr == '"')
+              {
+                ptr++;
+              }
+            
+            {
+               size_t len = strlen(ptr);
+               if (len > 0 && ptr[len - 1] == '"')
+                 {
+                   ptr[len - 1] = '\0';
+                 }
 
-                  if ((i < 0) || (i >= LESP_SECURITY_NBR))
-                    {
-                      return -1;
-                    }
+               if (*ptr == '\0')
+                 {
+                   strlcpy(ap->ssid, "<Hidden>", LESP_SSID_SIZE + 1);
+                 }
+               else
+                 {
+                   strlcpy(ap->ssid, ptr, LESP_SSID_SIZE + 1);
+                 }
+            }
+            break;
 
-                  ap->security = i;
-                }
-              break;
+          case 3: /* rssi */
+            {
+               int i = atoi(ptr);
+               ap->rssi = (i > 0) ? -i : i;
+            }
+            break;
 
-          case 2:
-              ptr++; /* Remove first '"' */
-              *(ptr_next - 1) = '\0';
-              strlcpy(ap->ssid, ptr, LESP_SSID_SIZE + 1);
-              break;
+          case 4: /* mac */
+             if (*ptr == '"')
+               {
+                 ptr++;
+               }
+             {
+                int i;
+                for (i = 0; i < LESP_BSSID_SIZE ; i++)
+                  {
+                    ap->bssid[i] = (uint8_t)strtol(ptr, &ptr, 16);
+                    if (*ptr == ':')
+                      {
+                        ptr++;
+                      }
+                  }
+             }
+             break;
 
-          case 3:
-                {
-                  int i = atoi(ptr);
+          case 5: /* channel */
+            ap->channel = atoi(ptr);
+            break;
 
-                  if (i > 0)
-                    {
-                      i = -i;
-                    }
+          case 6: /* scan_type */
+            ap->scan_type = atoi(ptr);
+            break;
 
-                  ap->rssi = i;
-                }
-              break;
+          case 7: /* scan_time_min */
+            ap->scan_time_min = atoi(ptr);
+            break;
 
-          case 4:
-                {
-                  int i;
+          case 8: /* scan_time_max */
+            ap->scan_time_max = atoi(ptr);
+            break;
 
-                  ptr++; /* Remove first '"' */
-                  *(ptr_next - 1) = '\0';
+          case 9: /* freq_offset */
+            ap->freq_offset = atoi(ptr);
+            break;
 
-                  for (i = 0; i < LESP_BSSID_SIZE ; i++)
-                    {
-                      ap->bssid[i] = strtol(ptr, &ptr, 16);
-                      if (*ptr == ':')
-                        {
-                          ptr++;
-                        }
-                    }
-                }
-              break;
+          case 10: /* freqcal_val */
+            ap->freqcal_val = atoi(ptr);
+            break;
 
-          case 5:
-                {
-                  int i = atoi(ptr);
+          case 11: /* pairwise_cipher */
+            ap->pairwise_cipher = atoi(ptr);
+            break;
 
-                  ap->channel = i;
-                }
-              break;
+          case 12: /* group_cipher */
+            ap->group_cipher = atoi(ptr);
+            break;
+
+          case 13: /* bgn */
+            ap->bgn = atoi(ptr);
+            break;
+            
+          case 14: /* wps */
+            ap->wps = atoi(ptr);
+            break;
+        }
+      
+      if (next_ptr == NULL)
+        {
+          break;
         }
 
-      ptr = ptr_next + 1;
+      ptr = next_ptr;
+      field_idx++;
     }
 
   return 0;
@@ -1255,6 +1354,9 @@ static void *lesp_worker(void *args)
 {
   int ret = 0;
   int rxlen = 0;
+  /* Use a block read buffer to reduce system call overhead. */
+  uint8_t tmp_buf[256]; 
+  int i;
 
   lesp_worker_t *worker = &g_lesp_state.worker;
 
@@ -1264,105 +1366,132 @@ static void *lesp_worker(void *args)
 
   while (worker->running)
     {
-      uint8_t c;
-
-      ret = lesp_low_level_read(&c, 1);
+      ret = lesp_low_level_read(tmp_buf, sizeof(tmp_buf));
 
       if (ret < 0)
         {
+          if (errno == EINTR)
+            {
+              continue; 
+            }
           nerr("ERROR: worker read data Error %d\n", ret);
+          /* Sleep briefly to prevent CPU hogging in case of a continuous error state */
+          usleep(1000); 
         }
       else if (ret > 0)
         {
-          /* ninfo("c:0x%02X (%c)\n", c); */
-
           pthread_mutex_lock(&(worker->mutex));
-          if (c == '\n')
+
+          for (i = 0; i < ret; i++)
             {
-              if (worker->rxbuf[rxlen - 1] == '\r')
+              uint8_t c = tmp_buf[i];
+
+              if (c == '\n')
                 {
-                  rxlen--;
-                }
-
-              DEBUGASSERT(rxlen >= 0);
-              DEBUGASSERT(rxlen < BUF_WORKER_LEN);
-
-              worker->rxbuf[rxlen] = '\0';
-
-              if (rxlen != 0)
-                {
-                  if (strcmp(worker->rxbuf, "OK") == 0)
+                  if (rxlen > 0 && worker->rxbuf[rxlen - 1] == '\r')
                     {
-                      worker->and = LESP_OK;
+                      rxlen--;
                     }
-                  else if ((strcmp(worker->rxbuf, "FAIL") == 0) ||
-                           (strcmp(worker->rxbuf, "ERROR") == 0)
-                          )
+
+                  DEBUGASSERT(rxlen >= 0);
+                  DEBUGASSERT(rxlen < BUF_WORKER_LEN);
+
+                  worker->rxbuf[rxlen] = '\0';
+
+                  if (rxlen != 0)
                     {
-                      worker->and = LESP_ERR;
-                    }
-                  else if ((rxlen == 8) &&
-                            (memcmp(worker->rxbuf + 1, ",CLOSED", 7) == 0))
-                    {
-                      unsigned int sockid = worker->rxbuf[0] - '0';
-                      if (sockid < SOCKET_NBR)
+                      if (strcmp(worker->rxbuf, "OK") == 0)
                         {
-                          set_sock_closed(sockid);
+                          worker->and = LESP_OK;
                         }
-                    }
-                  else
-                    {
-                      if (worker->buf[0] != '\0')
+                      else if ((strcmp(worker->rxbuf, "FAIL") == 0) ||
+                               (strcmp(worker->rxbuf, "ERROR") == 0)
+                              )
                         {
-                          pthread_mutex_unlock(&(worker->mutex));
-                          usleep(100); /* leave time of aplicative to read buffer */
-                          pthread_mutex_lock(&(worker->mutex));
+                          worker->and = LESP_ERR;
                         }
-
-                      /* ninfo("Worker Read data:%s\n", worker->rxbuf); */
-
-                      if (rxlen + 1 <= BUF_ANS_LEN)
+                      else if ((rxlen == 8) &&
+                                (memcmp(worker->rxbuf + 1, ",CLOSED", 7) == 0))
                         {
-                          memcpy(worker->buf, worker->rxbuf, rxlen + 1);
+                          unsigned int sockid = worker->rxbuf[0] - '0';
+                          if (sockid < SOCKET_NBR)
+                            {
+                              set_sock_closed(sockid);
+                            }
                         }
                       else
                         {
-                          nerr("Worker and line is too long:%s\n",
-                               worker->rxbuf);
-                        }
-                    }
+                          /* Flow control logic: If the upper layer hasn't consumed 
+                           * the previous data (buf is not empty), unlock and wait 
+                           * to give the application time to read the buffer.
+                           */
+                          if (worker->buf[0] != '\0')
+                            {
+                              pthread_mutex_unlock(&(worker->mutex));
+                              usleep(100); /* leave time for application to read buffer */
+                              pthread_mutex_lock(&(worker->mutex));
+                            }
 
-                  sem_post(&worker->sem);
-                  worker->rxbuf[0] = '\0';
-                  rxlen = 0;
+                          /* ninfo("Worker Read data:%s\n", worker->rxbuf); */
+
+                          if (rxlen + 1 <= BUF_ANS_LEN)
+                            {
+                              memcpy(worker->buf, worker->rxbuf, rxlen + 1);
+                            }
+                          else
+                            {
+                              nerr("Worker and line is too long:%s\n",
+                                   worker->rxbuf);
+                            }
+                        }
+
+                      sem_post(&worker->sem);
+                      worker->rxbuf[0] = '\0';
+                      rxlen = 0;
+                    }
                 }
-            }
-          else if (rxlen < BUF_WORKER_LEN - 1)
-            {
-              worker->rxbuf[rxlen++] = c;
-              if ((c == ':') && (memcmp(worker->rxbuf, "+IPD,", 5) == 0))
+              else if (rxlen < BUF_WORKER_LEN - 1)
                 {
-                  int sockfd;
-                  int len;
-                  char *ptr = worker->rxbuf + 5;
-
-                  sockfd = lesp_str_to_unsigned(&ptr, ',');
-                  if (sockfd >= 0)
+                  worker->rxbuf[rxlen++] = c;
+                  
+                  /* Check for +IPD packet header (Network Data) */
+                  if ((c == ':') && (memcmp(worker->rxbuf, "+IPD,", 5) == 0))
                     {
-                      len = lesp_str_to_unsigned(&ptr, ':');
-                      if (len >= 0)
-                        {
-                          lesp_read_ipd(sockfd, len);
-                        }
-                    }
+                      int sockfd;
+                      int len;
+                      char *ptr = worker->rxbuf + 5;
 
-                  rxlen = 0;
+                      sockfd = lesp_str_to_unsigned(&ptr, ',');
+                      if (sockfd >= 0)
+                        {
+                          len = lesp_str_to_unsigned(&ptr, ':');
+                          if (len >= 0)
+                            {
+                              /* Note: lesp_read_ipd internally reads the remaining payload 
+                               * directly from UART. If there are remaining unprocessed bytes 
+                               * in tmp_buf, it might cause payload data misalignment. 
+                               * However, for the current Scan corruption issue, this fix is 
+                               * sufficient. If high-throughput Socket data is involved, 
+                               * refactoring IPD logic is recommended.
+                               */
+                              lesp_read_ipd(sockfd, len);
+                            }
+                        }
+
+                      rxlen = 0;
+                    }
                 }
-            }
-          else
-            {
-              nerr("Read char overflow:%c\n", c);
-            }
+              else
+                {
+                  /* Buffer overflow protection */
+                  if (rxlen < BUF_WORKER_LEN) 
+                    {
+                       // Keep the last character null to prevent OOB
+                       worker->rxbuf[BUF_WORKER_LEN - 1] = '\0'; 
+                    }
+                  nerr("Read char overflow:%c\n", c);
+                }
+            } /* end for loop */
 
           pthread_mutex_unlock(&(worker->mutex));
         }
@@ -1616,10 +1745,8 @@ int lesp_soft_reset(void)
 
   pthread_mutex_lock(&g_lesp_state.mutex);
 
-  /* Rry to close opened reset */
-
+  /* Try to close opened sockets to avoid confusion */
   pthread_mutex_lock(&g_lesp_state.worker.mutex);
-
   for (i = 0; i < SOCKET_NBR; i++)
     {
       if ((g_lesp_state.sockets[i].flags & FLAGS_SOCK_USED) != 0)
@@ -1627,23 +1754,20 @@ int lesp_soft_reset(void)
           set_sock_closed(i);
         }
     }
-
   pthread_mutex_unlock(&g_lesp_state.worker.mutex);
 
-  /* Leave time to close socket */
-
+  /* Leave time to close socket at system level */
   sleep(1);
 
-  /* Send reset */
-
+  /* Send hard reset */
   lesp_send_cmd("AT+RST\r\n");
 
-  /* Leave time to reset */
-
-  sleep(1);
+  /* Wait for boot logs (garbage data) to finish */
+  sleep(2); 
 
   lesp_flush();
 
+  /* Sync baudrate and disable echo */
   while (lesp_ask_ans_ok(LESP_TIMEOUT_MS, "ATE0\r\n") < 0)
     {
       sleep(1);
@@ -1655,15 +1779,19 @@ int lesp_soft_reset(void)
       ret = lesp_ask_ans_ok(LESP_TIMEOUT_MS, "AT+GMR\r\n");
     }
 
-  /* Enable the module to act as a “Station” */
-
+  /* Set to Station mode */
   if (ret >= 0)
     {
-      ret = lesp_ask_ans_ok(LESP_TIMEOUT_MS, "AT+CWMODE_CUR=1\r\n");
+      ret = lesp_ask_ans_ok(LESP_TIMEOUT_MS, "AT+CWMODE=1\r\n");
+    }
+
+  /* Disable auto connect */
+  if (ret >= 0)
+    {
+      ret = lesp_ask_ans_ok(LESP_TIMEOUT_MS, "AT+CWAUTOCONN=0\r\n");
     }
 
   /* Enable the multi connection */
-
   if (ret >= 0)
     {
       ret = lesp_ask_ans_ok(LESP_TIMEOUT_MS, "AT+CIPMUX=1\r\n");
@@ -1676,7 +1804,7 @@ int lesp_soft_reset(void)
 
   pthread_mutex_unlock(&g_lesp_state.mutex);
 
-  return 0;
+  return ret;
 }
 
 /****************************************************************************
@@ -2101,30 +2229,66 @@ int lesp_list_access_points(lesp_cb_t cb)
 
       ninfo("Read:%s\n", g_lesp_state.bufans);
 
+      /* Check OK */
       if (strcmp(g_lesp_state.bufans, "OK") == 0)
         {
           break;
         }
 
-      ret = lesp_parse_cwlap_ans_line(g_lesp_state.bufans, &ap);
-      if (ret < 0)
+      /* Check ERROR or FAIL */
+      if (strncmp(g_lesp_state.bufans, "ERROR", 5) == 0 ||
+          strncmp(g_lesp_state.bufans, "FAIL", 4) == 0)
         {
-          nerr("ERROR: Line badly formed.");
+           ret = -1;
+           break;
         }
 
-      cb(&ap);
+      /* Check +CWLAP prefix */
+      if (strncmp(g_lesp_state.bufans, "+CWLAP", 6) != 0)
+        {
+          nwarn("WARNING: Ignored non-AP line: %s\n", g_lesp_state.bufans);
+          ret = 0; 
+          continue;
+        }
+
+      /* Reset ap structure */
+      memset(&ap, 0, sizeof(lesp_ap_t));
+
+      int parse_ret = lesp_parse_cwlap_ans_line(g_lesp_state.bufans, &ap);
+
+      if (parse_ret < 0)
+        {
+          nwarn("WARNING: Malformed AP line skipped: %s\n", g_lesp_state.bufans);
+          ret = 0; 
+          continue;
+        }
+
+      if (ap.rssi == 0)
+        {
+           nwarn("WARNING: Empty AP data skipped (RSSI=0)\n");
+           continue;
+        }
+
+      if (cb)
+        {
+          cb(&ap);
+        }
       number++;
     }
 
   pthread_mutex_unlock(&g_lesp_state.mutex);
 
-  if (ret < 0)
+  if (number > 0)
     {
-      nerr("ERROR: list access points.");
-      return -1;
+      ninfo("Scan finished. Found %d APs.\n", number);
+      return number;
     }
 
-  ninfo("Access Point list finished with %d ap founds\n", number);
+  if (ret < 0)
+    {
+      nerr("ERROR: list access points failed.");
+      return -1;
+    }
 
   return number;
 }
@@ -2148,7 +2312,7 @@ const char *lesp_security_to_str(lesp_security_t security)
   switch (security)
     {
       case LESP_SECURITY_NONE:
-          return "NONE";
+          return "OPEN";
       case LESP_SECURITY_WEP:
           return "WEP";
       case LESP_SECURITY_WPA_PSK:
@@ -2157,6 +2321,12 @@ const char *lesp_security_to_str(lesp_security_t security)
           return "WPA2_PSK";
       case LESP_SECURITY_WPA_WPA2_PSK:
           return "WPA_WPA2_PSK";
+      case LESP_SECURITY_WPA2_ENTERPRISE:
+          return "WPA2_ENTERPRISE";
+      case LESP_SECURITY_WPA3_PSK:
+          return "WPA3_PSK";
+      case LESP_SECURITY_WPA2_WPA3_PSK:
+          return "WPA2_WPA3_PSK";
       default:
           return "Unknown";
     }
