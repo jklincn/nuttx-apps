@@ -941,61 +941,50 @@ static int lesp_parse_cwdomain_ans_line(const char *ptr, in_addr_t *ip)
  *
  ****************************************************************************/
 
-static int lesp_parse_cipxxx_ans_line(const char *ptr, in_addr_t *ip)
+static int lesp_parse_cipxxx_ans_line(char *ptr, in_addr_t *ip)
 {
-  int field_idx;
-  char *ptr_next;
+  char *val;
+  char *end;
+  struct in_addr inp;
 
-  for (field_idx = 0; field_idx <= 2; field_idx++)
+  /* Expected format: +CIPSTA:ip:"192.168.1.108"
+   * Extract the value after the last ':'
+   */
+  val = strrchr(ptr, ':');
+  if (val == NULL)
     {
-      if (field_idx <= 1)
-        {
-          ptr_next = strchr(ptr, ':');
-        }
-      else if (field_idx == 2)
-        {
-          ptr_next = strchr(ptr, '\0');
-        }
-      else
-        {
-          ptr_next = strchr(ptr, ',');
-        }
-
-      if (ptr_next == NULL)
-        {
-          return -1;
-        }
-
-      *ptr_next = '\0';
-
-      switch (field_idx)
-        {
-          case 0:
-              if (strncmp(ptr, "+CIP", 4) != 0)
-                {
-                  return -1;
-                }
-
-              break;
-
-          case 1:
-
-              /* ip label */
-
-              break;
-          case 2:
-              ptr++; /* Remove first '"' */
-              *(ptr_next - 1) = '\0';
-              if (inet_pton(AF_INET, ptr, ip) < 0)
-                {
-                  return -1;
-                }
-              break;
-        }
-
-      ptr = ptr_next + 1;
+      nerr("ERROR: No colon found in %s\n", ptr);
+      return -1;
     }
 
+  val++; /* Skip ':' */
+
+  /* Skip leading quotes and whitespace */
+  while (*val && (*val == '"' || *val == ' ' || *val == '\t'))
+    {
+      val++;
+    }
+
+  /* Remove trailing quotes, whitespace, and line endings */
+  end = val + strlen(val) - 1;
+  while (end > val && (*end == '"' || *end == ' ' || *end == '\t' || 
+         *end == '\r' || *end == '\n'))
+    {
+      *end = '\0';
+      end--;
+    }
+
+  ninfo("Parsing IP from: '%s'\n", val);
+
+  /* Use inet_pton for standard IP address parsing */
+  if (inet_pton(AF_INET, val, &inp) != 1)
+    {
+      nerr("ERROR: Failed to parse IP address from '%s'\n", val);
+      return -1;
+    }
+
+  /* inet_pton already stores in network byte order */
+  *ip = inp.s_addr;
   return 0;
 }
 
@@ -1886,7 +1875,7 @@ int lesp_ap_get(lesp_ap_t *ap)
 
   if (ret >= 0)
     {
-      ret = lesp_send_cmd("AT+CWJAP_CUR?\r\n");
+      ret = lesp_send_cmd("AT+CWJAP?\r\n");
     }
 
   if (ret >= 0)
@@ -1952,62 +1941,62 @@ int lesp_get_net(lesp_mode_t mode, in_addr_t *ip,
 
   if (ret >= 0)
     {
-      ret = lesp_send_cmd("AT+CIP%s_CUR?\r\n",
+      ret = lesp_send_cmd("AT+CIP%s?\r\n",
                           (mode == LESP_MODE_STATION) ? "STA" : "AP");
     }
 
   if (ret >= 0)
     {
-      ret = lesp_read(LESP_TIMEOUT_MS);
-    }
-
-  if (ret >= 0)
-    {
-      ninfo("Read:%s\n", g_lesp_state.bufans);
-
-      ret = lesp_parse_cipxxx_ans_line(g_lesp_state.bufans, ip);
-      if (ret < 0)
+      /* Loop until we get OK, ERROR or Timeout */
+      while (g_lesp_state.and == LESP_NONE)
         {
-          nerr("ERROR: Line badly formed.\n");
+          ret = lesp_read(LESP_TIMEOUT_MS);
+          if (ret < 0)
+            {
+              nerr("ERROR: Timeout getting net info.\n");
+              break;
+            }
+
+          if (ret > 0)
+            {
+              ninfo("Read:%s\n", g_lesp_state.bufans);
+
+              if (strstr(g_lesp_state.bufans, ":ip:"))
+                {
+                  if (lesp_parse_cipxxx_ans_line(g_lesp_state.bufans, ip) < 0)
+                    {
+                      nwarn("WARNING: Bad IP line.\n");
+                    }
+                }
+              else if (strstr(g_lesp_state.bufans, ":gateway:"))
+                {
+                  if (lesp_parse_cipxxx_ans_line(g_lesp_state.bufans, gw) < 0)
+                    {
+                      nwarn("WARNING: Bad Gateway line.\n");
+                    }
+                }
+              else if (strstr(g_lesp_state.bufans, ":netmask:"))
+                {
+                  if (lesp_parse_cipxxx_ans_line(g_lesp_state.bufans, mask) < 0)
+                    {
+                      nwarn("WARNING: Bad Netmask line.\n");
+                    }
+                }
+            }
         }
     }
 
-  if (ret >= 0)
+  if (g_lesp_state.and != LESP_OK)
     {
-      ret = lesp_read(LESP_TIMEOUT_MS);
+      ret = -1;
+    }
+  else
+    {
+      ret = 0;
     }
 
-  if (ret >= 0)
-    {
-      ninfo("Read:%s\n", g_lesp_state.bufans);
-
-      ret = lesp_parse_cipxxx_ans_line(g_lesp_state.bufans, gw);
-      if (ret < 0)
-        {
-          nerr("ERROR: Line badly formed.\n");
-        }
-    }
-
-  if (ret >= 0)
-    {
-      ret = lesp_read(LESP_TIMEOUT_MS);
-    }
-
-  if (ret >= 0)
-    {
-      ninfo("Read:%s\n", g_lesp_state.bufans);
-
-      ret = lesp_parse_cipxxx_ans_line(g_lesp_state.bufans, mask);
-      if (ret < 0)
-        {
-          nerr("ERROR: Line badly formed.\n");
-        }
-    }
-
-  if (ret >= 0)
-    {
-      ret = lesp_read_ans_ok(LESP_TIMEOUT_MS);
-    }
+  lesp_clear_read_ans();
+  lesp_clear_read_buffer();
 
   pthread_mutex_unlock(&g_lesp_state.mutex);
 
@@ -2049,7 +2038,7 @@ int lesp_set_net(lesp_mode_t mode, in_addr_t ip,
 
   if (ret >= 0)
     {
-      ret = lesp_ask_ans_ok(LESP_TIMEOUT_MS, "AT+CIP%s_CUR=\"%u.%u.%u.%u\","
+      ret = lesp_ask_ans_ok(LESP_TIMEOUT_MS, "AT+CIP%s=\"%u.%u.%u.%u\","
                             "\"%u.%u.%u.%u\",\"%u.%u.%u.%u\"\r\n",
                             (mode == LESP_MODE_STATION) ? "STA" : "AP",
                             ip4_addr1(ip), ip4_addr2(ip),
@@ -2095,7 +2084,7 @@ int lesp_set_dhcp(lesp_mode_t mode, bool enable)
 
   if (ret >= 0)
     {
-      ret = lesp_ask_ans_ok(LESP_TIMEOUT_MS, "AT+CWDHCP_CUR=%d,%c\r\n",
+      ret = lesp_ask_ans_ok(LESP_TIMEOUT_MS, "AT+CWDHCP=%d,%c\r\n",
                             mode, enable ? '1' : '0');
     }
 
@@ -2136,7 +2125,7 @@ int lesp_get_dhcp(bool *ap_enable, bool *sta_enable)
 
   if (ret >= 0)
     {
-      ret = lesp_send_cmd("AT+CWDHCP_CUR?\r\n");
+      ret = lesp_send_cmd("AT+CWDHCP?\r\n");
     }
 
   if (ret >= 0)
