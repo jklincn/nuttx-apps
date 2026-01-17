@@ -2239,6 +2239,7 @@ int lesp_list_access_points(lesp_cb_t cb)
   lesp_ap_t ap;
   int ret = 0;
   int number = 0;
+  int timeout_retries = 0;
 
   pthread_mutex_lock(&g_lesp_state.mutex);
 
@@ -2259,10 +2260,15 @@ int lesp_list_access_points(lesp_cb_t cb)
   while (ret >= 0)
     {
       ret = lesp_read(LESP_TIMEOUT_MS_LISP_AP);
+
+      /* If OK/ERROR arrives as an async flag (without a literal line),
+       * stop immediately.
+       */
       
       if (g_lesp_state.and == LESP_OK)
         {
           ninfo("Received OK, scan complete.\n");
+          g_lesp_state.and = LESP_NONE;
           ret = 0;
           break;
         }
@@ -2270,16 +2276,40 @@ int lesp_list_access_points(lesp_cb_t cb)
       if (g_lesp_state.and == LESP_ERR)
         {
           nerr("ERROR: Received ERROR/FAIL during scan.\n");
+          g_lesp_state.and = LESP_NONE;
           ret = -1;
           break;
         }
 
       if (ret < 0)
         {
-          nwarn("WARNING: Read timeout, retrying...\n");
+          /* Many firmwares end AT+CWLAP with OK, but some may stop sending
+           * lines without a final OK. If we already got results, treat the
+           * timeout as end-of-scan. Otherwise, retry a few times.
+           */
+
+          timeout_retries++;
+
+          if (number > 0)
+            {
+              ninfo("Scan timed out after results; assume complete.\n");
+              ret = 0;
+              break;
+            }
+
+          if (timeout_retries >= 3)
+            {
+              nerr("ERROR: Scan timed out (no results).\n");
+              ret = -1;
+              break;
+            }
+
+          /* Keep retrying quietly to avoid log spam */
           ret = 0;
           continue;
         }
+
+      timeout_retries = 0;
 
       if (ret == 0)
         {
