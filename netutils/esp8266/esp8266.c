@@ -95,6 +95,7 @@
 
 #define FLAGS_SOCK_USED               (1 << 0)
 #define FLAGS_SOCK_CONNECTED          (1 << 1)
+#define FLAGS_SOCK_CLOSED             (1 << 4) /* remote closed, RX may remain */
 
 #define FLAGS_SOCK_TYPE_MASK          (3 << 2)
 #define FLAGS_SOCK_TYPE_TCP           (0 << 2)
@@ -119,6 +120,7 @@ typedef struct
   uint16_t        inndx;
   uint16_t        outndx;
   struct timespec rcv_timeo;
+  char            sni[65];
   uint8_t         rxbuf[SOCKET_FIFO_SIZE];
 } lesp_socket_t;
 
@@ -321,8 +323,11 @@ static lesp_socket_t *get_sock(int sockfd)
 
   if ((g_lesp_state.sockets[sockfd].flags & FLAGS_SOCK_USED) == 0)
     {
-      errno = EPERM;
-      nerr("ERROR: Connection id %d not Created!\n", sockfd);
+      /* Socket already closed (possibly by worker on remote CLOSE).
+       * Treat as a normal "not connected" condition and avoid noisy logs
+       * that can interleave with application output.
+       */
+      errno = ENOTCONN;
       return NULL;
     }
 
@@ -381,8 +386,32 @@ static void set_sock_closed(int sockfd)
   sock->flags  = 0;
   sock->inndx  = 0;
   sock->outndx = 0;
+  sock->sni[0] = '\0';
 
   ninfo("Socket %d closed\n", sockfd);
+
+  if (sem != NULL)
+    {
+      sem_post(sem);
+    }
+}
+
+static void mark_sock_remote_closed(int sockfd)
+{
+  sem_t *sem;
+  lesp_socket_t *sock;
+
+  DEBUGASSERT(((unsigned int)sockfd) < SOCKET_NBR);
+
+  sock = &g_lesp_state.sockets[sockfd];
+  sem  = sock->sem;
+
+  /* Keep socket allocated so application can drain any buffered RX data. */
+  sock->flags &= ~FLAGS_SOCK_CONNECTED;
+  sock->flags |= FLAGS_SOCK_CLOSED;
+  sock->sem    = NULL;
+
+  ninfo("Socket %d remote closed\n", sockfd);
 
   if (sem != NULL)
     {
@@ -862,51 +891,61 @@ static int lesp_check(void)
 
 static int lesp_parse_cwdomain_ans_line(const char *ptr, in_addr_t *ip)
 {
-  int field_idx;
-  char *ptr_next;
+  const char *val;
+  const char *end;
+  char ipbuf[32];
+  size_t len;
+  struct in_addr inp;
 
-  for (field_idx = 0; field_idx <= 1; field_idx++)
+  if (ptr == NULL || ip == NULL)
     {
-      if (field_idx == 0)
-        {
-          ptr_next = strchr(ptr, ':');
-        }
-      else if (field_idx == 1)
-        {
-          ptr_next = strchr(ptr, '\0');
-        }
-
-      if (ptr_next == NULL)
-        {
-          return -1;
-        }
-
-      *ptr_next = '\0';
-
-      switch (field_idx)
-        {
-          case 0:
-              if (strncmp(ptr, "+CIP", 4) != 0)
-                {
-                  return -1;
-                }
-
-              break;
-
-          case 1:
-
-              /* No '"' for this command ! */
-
-              if (inet_pton(AF_INET, ptr, ip) < 0)
-                {
-                  return -1;
-                }
-              break;
-        }
-
-      ptr = ptr_next + 1;
+      return -1;
     }
 
+  if (strncmp(ptr, "+CIPDOMAIN", 10) != 0)
+    {
+      return -1;
+    }
+
+  val = strchr(ptr, ':');
+  if (val == NULL)
+    {
+      return -1;
+    }
+
+  val++;
+
+  while (*val == ' ' || *val == '\t' || *val == '"')
+    {
+      val++;
+    }
+
+  if (*val == '\0' || *val == '\r' || *val == '\n')
+    {
+      return -1;
+    }
+
+  end = val;
+  while (*end != '\0' && *end != '"' && *end != '\r' && *end != '\n')
+    {
+      end++;
+    }
+
+  len = end - val;
+  if (len == 0 || len >= sizeof(ipbuf))
+    {
+      return -1;
+    }
+
+  memcpy(ipbuf, val, len);
+  ipbuf[len] = '\0';
+
+  if (inet_pton(AF_INET, ipbuf, &inp) != 1)
+    {
+      return -1;
+    }
+
+  *ip = inp.s_addr;
   return 0;
 }
 
@@ -1414,7 +1453,7 @@ static void *lesp_worker(void *args)
                           unsigned int sockid = worker->rxbuf[0] - '0';
                           if (sockid < SOCKET_NBR)
                             {
-                              set_sock_closed(sockid);
+                              mark_sock_remote_closed(sockid);
                             }
                         }
                       else
@@ -2397,6 +2436,7 @@ int lesp_socket(int domain, int type, int protocol)
               g_lesp_state.sockets[i].rcv_timeo.tv_sec =
                                               LESP_TIMEOUT_MS_RECV_S;
               g_lesp_state.sockets[i].rcv_timeo.tv_nsec = 0;
+              g_lesp_state.sockets[i].sni[0] = '\0';
               ret = i;
               break;
             }
@@ -2433,6 +2473,25 @@ int lesp_closesocket(int sockfd)
   int ret = 0;
   lesp_socket_t *sock = NULL;
 
+  /* Idempotent close: if the worker already processed "<id>,CLOSED" and
+   * cleared FLAGS_SOCK_USED, do not treat that as an error and avoid noisy
+   * logs from get_sock().
+   */
+
+  if (((unsigned int)sockfd) >= SOCKET_NBR)
+    {
+      errno = EINVAL;
+      return -1;
+    }
+
+  pthread_mutex_lock(&g_lesp_state.worker.mutex);
+  if ((g_lesp_state.sockets[sockfd].flags & FLAGS_SOCK_USED) == 0)
+    {
+      pthread_mutex_unlock(&g_lesp_state.worker.mutex);
+      return 0;
+    }
+  pthread_mutex_unlock(&g_lesp_state.worker.mutex);
+
   pthread_mutex_lock(&g_lesp_state.mutex);
 
   ninfo("List access point(s)...\n");
@@ -2444,13 +2503,26 @@ int lesp_closesocket(int sockfd)
       sock = get_sock_protected(sockfd);
       if (sock == NULL)
         {
-          ret = -1;
+          /* Socket may already be closed by asynchronous "<id>,CLOSED". */
+          pthread_mutex_unlock(&g_lesp_state.mutex);
+          return 0;
         }
     }
 
   if (ret >= 0)
     {
       ret = lesp_ask_ans_ok(LESP_TIMEOUT_MS, "AT+CIPCLOSE=%d\r\n", sockfd);
+
+      /* Some firmwares respond ERROR if the link is already closed (e.g.,
+       * remote sent FIN and we already processed "<id>,CLOSED").  Closing is
+       * idempotent from the caller perspective, so treat that as success and
+       * always release local state.
+       */
+
+      if (ret < 0)
+        {
+          ret = 0;
+        }
 
       pthread_mutex_lock(&g_lesp_state.worker.mutex);
       set_sock_closed(sockfd);
@@ -2506,6 +2578,38 @@ int lesp_bind(int sockfd, FAR const struct sockaddr *addr, socklen_t addrlen)
 }
 
 /****************************************************************************
+ * Name:  lesp_setsni
+ *
+ * Description:
+ *   Set SNI (Server Name Indication) for SSL connections.
+ *   Must be configured before lesp_connect() when using SSL socket type.
+ *
+ ****************************************************************************/
+
+int lesp_setsni(int sockfd, FAR const char *sni)
+{
+  lesp_socket_t *sock;
+
+  if (sni == NULL || sni[0] == '\0' || strlen(sni) >= sizeof(((lesp_socket_t *)0)->sni))
+    {
+      errno = EINVAL;
+      return -1;
+    }
+
+  pthread_mutex_lock(&g_lesp_state.worker.mutex);
+  sock = get_sock(sockfd);
+  if (sock == NULL)
+    {
+      pthread_mutex_unlock(&g_lesp_state.worker.mutex);
+      return -1;
+    }
+
+  strlcpy(sock->sni, sni, sizeof(sock->sni));
+  pthread_mutex_unlock(&g_lesp_state.worker.mutex);
+  return 0;
+}
+
+/****************************************************************************
  * Name:  lesp_connect
  *
  * Description:
@@ -2525,14 +2629,17 @@ int lesp_connect(int sockfd, FAR const struct sockaddr *addr,
                  socklen_t addrlen)
 {
   int ret = 0;
+  int timeout_ms = LESP_TIMEOUT_MS;
   const char *proto_str = "";
   lesp_socket_t *sock;
+  bool is_ssl = false;
+  const char *sni = NULL;
   struct sockaddr_in *in;
   unsigned short port;
   in_addr_t ip;
 
   in = (struct sockaddr_in *)addr;
-  port = ntohs(in->sin_port);     /* e.g. htons(3490) */
+  port = ntohs(in->sin_port);
   ip = in->sin_addr.s_addr;
 
   DEBUGASSERT(in->sin_family == AF_INET);
@@ -2560,12 +2667,20 @@ int lesp_connect(int sockfd, FAR const struct sockaddr *addr,
         {
           case FLAGS_SOCK_TYPE_TCP:
               proto_str = "TCP";
+              timeout_ms = LESP_TIMEOUT_MS_CONNECTION;
               break;
           case FLAGS_SOCK_TYPE_UDP:
               proto_str = "UDP";
+              timeout_ms = LESP_TIMEOUT_MS_CONNECTION;
               break;
           case FLAGS_SOCK_TYPE_SSL:
               proto_str = "SSL";
+              timeout_ms = LESP_TIMEOUT_MS_CONNECTION;
+              is_ssl = true;
+              if (sock->sni[0] != '\0')
+                {
+                  sni = sock->sni;
+                }
               break;
           default:
               errno = ESOCKTNOSUPPORT;
@@ -2575,13 +2690,52 @@ int lesp_connect(int sockfd, FAR const struct sockaddr *addr,
 
   pthread_mutex_unlock(&g_lesp_state.worker.mutex);
 
+  /* SSL/TLS: configure SNI and auth mode before connecting.
+   * Many modern HTTPS servers (e.g., Cloudflare) require SNI.
+   * Default auth mode can also require CA store; we default to "no verify"
+   * to maximize compatibility on constrained targets.
+   */
+
+  if (ret >= 0 && is_ssl)
+    {
+      int cfgret;
+
+      /* Best-effort: if the firmware does not support these commands,
+       * CIPSTART may still work for some servers.
+       */
+
+      if (sni != NULL)
+        {
+          cfgret = lesp_ask_ans_ok(LESP_TIMEOUT_MS,
+                                  "AT+CIPSSLCSNI=%d,\"%s\"\r\n",
+                                  sockfd, sni);
+          if (cfgret < 0)
+            {
+              nwarn("WARNING: Failed to set SSL SNI for link %d\n", sockfd);
+              lesp_clear_read_ans();
+              lesp_clear_read_buffer();
+            }
+        }
+
+      cfgret = lesp_ask_ans_ok(LESP_TIMEOUT_MS,
+                              "AT+CIPSSLCCONF=%d,0\r\n",
+                              sockfd);
+      if (cfgret < 0)
+        {
+          nwarn("WARNING: Failed to set SSL auth_mode=0 for link %d\n",
+                sockfd);
+          lesp_clear_read_ans();
+          lesp_clear_read_buffer();
+        }
+    }
+
   if (ret >= 0)
     {
-      ret = lesp_ask_ans_ok(LESP_TIMEOUT_MS, "AT+CIPSTART=%d,\"%s\","
-                            "\"%u.%u.%u.%u\",%d\r\n", sockfd, proto_str,
+      ret = lesp_ask_ans_ok(timeout_ms, "AT+CIPSTART=%d,\"%s\","
+                            "\"%u.%u.%u.%u\",%u\r\n", sockfd, proto_str,
                             ip4_addr1(ip), ip4_addr2(ip),
                             ip4_addr3(ip), ip4_addr4(ip),
-                            port);
+                            (unsigned)port);
       if (ret < 0)
         {
           errno = EIO;
@@ -2802,6 +2956,14 @@ ssize_t lesp_recv(int sockfd, FAR uint8_t *buf, size_t len, int flags)
       ret = -1;
     }
 
+  /* If the remote already closed and no data is buffered, report EOF. */
+  if (ret >= 0 && (sock->flags & FLAGS_SOCK_CLOSED) != 0 &&
+      sock->inndx == sock->outndx)
+    {
+      pthread_mutex_unlock(&g_lesp_state.worker.mutex);
+      return 0;
+    }
+
   if (ret >= 0 && sock->inndx == sock->outndx)
     {
       struct timespec ts;
@@ -2824,6 +2986,12 @@ ssize_t lesp_recv(int sockfd, FAR uint8_t *buf, size_t len, int flags)
 
           while (ret >= 0 && sock->inndx == sock->outndx)
             {
+              /* If the socket is closed, don't wait for more data. */
+              if ((sock->flags & FLAGS_SOCK_CLOSED) != 0)
+                {
+                  break;
+                }
+
               pthread_mutex_unlock(&g_lesp_state.worker.mutex);
               ret = sem_timedwait(&sem, &ts);
               pthread_mutex_lock(&g_lesp_state.worker.mutex);
@@ -3002,6 +3170,8 @@ int lesp_getsockopt(int sockfd, int level, int option, FAR void *value,
 FAR struct hostent *lesp_gethostbyname(FAR const char *hostname)
 {
   int ret = 0;
+  bool got_ip = false;
+  time_t end;
 
   memset(&g_lesp_state.hostent, 0, sizeof(g_lesp_state.hostent));
 
@@ -3020,31 +3190,44 @@ FAR struct hostent *lesp_gethostbyname(FAR const char *hostname)
 
   if (ret >= 0)
     {
-      ret = lesp_send_cmd("AT+CIPDOMAIN=\"%s\"\r\n", hostname);
+      ret = lesp_send_cmd("AT+CIPDOMAIN=\"%s\",2\r\n", hostname);
     }
 
   if (ret >= 0)
     {
-      ret = lesp_read(LESP_TIMEOUT_MS);
-    }
+      end = time(NULL) + (LESP_TIMEOUT_MS / 1000) +
+            LESP_TIMEOUT_FLOODING_OFFSET_S;
 
-  if (ret >= 0)
-    {
-      ninfo("Read:%s\n", g_lesp_state.bufans);
-
-      ret = lesp_parse_cwdomain_ans_line(g_lesp_state.bufans,
-                                         &g_lesp_state.in_addr);
-
-      if (ret < 0)
+      while (g_lesp_state.and != LESP_OK)
         {
-          nerr("ERROR: Line badly formed.\n");
-          errno = EIO;
+          ret = lesp_read(LESP_TIMEOUT_MS);
+
+          if (ret < 0 || g_lesp_state.and == LESP_ERR ||
+              time(NULL) > end)
+            {
+              ret = -1;
+              break;
+            }
+
+          if (ret > 0 &&
+              strncmp(g_lesp_state.bufans, "+CIPDOMAIN", 10) == 0)
+            {
+              if (lesp_parse_cwdomain_ans_line(g_lesp_state.bufans,
+                                               &g_lesp_state.in_addr) == 0)
+                {
+                  got_ip = true;
+                }
+            }
         }
     }
 
   if (ret >= 0)
     {
-      ret = lesp_read_ans_ok(LESP_TIMEOUT_MS);
+      if (!got_ip)
+        {
+          ret = -1;
+          errno = EIO;
+        }
     }
 
   pthread_mutex_unlock(&g_lesp_state.mutex);

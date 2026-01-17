@@ -29,6 +29,7 @@
 
 #include "nuttx/config.h"
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <netinet/in.h>
 
@@ -118,6 +119,12 @@ int lesp_bind(int sockfd,
               FAR const struct sockaddr *addr, socklen_t addrlen);
 int lesp_connect(int sockfd,
                  FAR const struct sockaddr *addr, socklen_t addrlen);
+
+/* Optional helper for HTTPS/TLS servers requiring SNI.
+ * Must be called before lesp_connect() when using SSL socket type.
+ */
+
+int lesp_setsni(int sockfd, FAR const char *sni);
 int lesp_listen(int sockfd, int backlog);
 int lesp_accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen);
 ssize_t lesp_send(int sockfd, FAR const uint8_t *buf, size_t len, int flags);

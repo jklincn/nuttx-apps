@@ -6,6 +6,7 @@
 config NETUTILS_ESP8266
 	bool "ESP8266"
 	select ARCH_HAVE_NET
+	select NET
 	default n
 	---help---
 		Enable support for ESP8266 application interface.
